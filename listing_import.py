@@ -312,7 +312,26 @@ def _parse_trulia(html: str, url: str) -> dict:
                 except Exception:
                     pass
 
-    # ── 3. Rendered HTML text regex ───────────────────────────────────────────
+    # ── 3. Trulia "Property Tax and Assessment" section ──────────────────────
+    # Trulia renders taxes in a table under a heading with data-testid="styled-section-container-heading"
+    if "annual_taxes" not in result:
+        tax_section = re.search(
+            r'Property Tax and Assessment.{0,2000}?</table>',
+            html, re.S | re.I
+        )
+        if tax_section:
+            # Find dollar amounts inside that table
+            amounts = re.findall(r'\$\s*([\d,]+)', tax_section.group())
+            for amt in amounts:
+                try:
+                    val = float(amt.replace(",", ""))
+                    if 100 <= val <= 50000:
+                        result["annual_taxes"] = val
+                        break
+                except Exception:
+                    pass
+
+    # ── 4. Rendered HTML text regex ───────────────────────────────────────────
     if "annual_taxes" not in result:
         for pattern in [
             r'tax[^$\d]{0,30}\$\s*([\d,]+)\s*/\s*(?:per\s+)?year',
@@ -331,7 +350,7 @@ def _parse_trulia(html: str, url: str) -> dict:
                 except Exception:
                     pass
 
-    # ── 4. Address fallback ───────────────────────────────────────────────────
+    # ── 5. Address fallback ───────────────────────────────────────────────────
     if "address" not in result:
         m = re.search(r'"streetAddress"\s*:\s*"([^"]+)"', html)
         if m:
@@ -342,7 +361,7 @@ def _parse_trulia(html: str, url: str) -> dict:
         if m2 and m3:
             result["city_state_zip"] = f"{m2.group(1)}, {m3.group(1)} {m4.group(1) if m4 else ''}".strip()
 
-    # ── 5. Price fallback ─────────────────────────────────────────────────────
+    # ── 6. Price fallback ─────────────────────────────────────────────────────
     if "purchase_price" not in result:
         for pattern in [
             r'"listingPrice"\s*:\s*\{"amount"\s*:\s*(\d+)',
@@ -355,7 +374,7 @@ def _parse_trulia(html: str, url: str) -> dict:
                     result["purchase_price"] = p
                     break
 
-    # ── 6. Tax last-resort: scan ALL numeric values adjacent to "tax" in raw HTML ──
+    # ── 7. Tax last-resort: scan ALL numeric values adjacent to "tax" in raw HTML ──
     if "annual_taxes" not in result:
         # Try JSON-LD structured data first
         jld = _extract_json_ld(html)
@@ -388,7 +407,7 @@ def _parse_trulia(html: str, url: str) -> dict:
                 except Exception:
                     pass
 
-    # ── 7. Store debug info so UI can show what keys were found ───────────────
+    # ── 8. Store debug info so UI can show what keys were found ───────────────
     try:
         nd2 = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
         if nd2:
@@ -401,6 +420,31 @@ def _parse_trulia(html: str, url: str) -> dict:
             result["_debug_tax_pairs"] = [f"{k}: {v.strip()}" for k, v in tax_pairs[:15]]
     except Exception:
         pass
+
+    # ── 9. AI extraction for taxes — last resort when all regex failed ────────
+    if "annual_taxes" not in result:
+        try:
+            import anthropic
+            client = anthropic.Anthropic()
+            stripped = re.sub(r'<[^>]+>', ' ', html)
+            stripped = re.sub(r'\s+', ' ', stripped)
+            tax_windows = [m.group() for m in re.finditer(r'.{0,200}[Tt]ax.{0,200}', stripped)]
+            snippet = ' | '.join(tax_windows[:10])[:3000] if tax_windows else stripped[:3000]
+            resp = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=100,
+                messages=[{"role": "user", "content": (
+                    "From this real estate listing text, find the annual property tax amount in dollars. "
+                    "Return ONLY a plain number like 2400. If not found, return null.\n\n" + snippet
+                )}],
+            )
+            raw_tax = resp.content[0].text.strip()
+            if raw_tax.lower() != "null":
+                val = float(raw_tax.replace(",", "").replace("$", "").strip())
+                if 100 <= val <= 100000:
+                    result["annual_taxes"] = val
+        except Exception:
+            pass
 
     return result
 
