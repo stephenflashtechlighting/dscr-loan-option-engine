@@ -1,4 +1,5 @@
 import streamlit as st
+import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import json
 from pathlib import Path
 from config import BASE_DIR, SCORING_WEIGHTS, FEE_DEFAULTS, OBJECTIVE_MODE_LABELS

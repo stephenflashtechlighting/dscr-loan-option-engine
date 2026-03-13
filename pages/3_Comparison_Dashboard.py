@@ -1,4 +1,5 @@
 import streamlit as st
+import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pandas as pd
 from db import get_deal, list_scenarios
 from services.reports import scenarios_to_dataframe, dataframe_to_csv_bytes, build_decision_memo_pdf, build_decision_memo_text

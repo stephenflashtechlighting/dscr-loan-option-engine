@@ -1,4 +1,5 @@
 import streamlit as st
+import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db import get_deal, upsert_scenario
 from models import LoanScenario
 from services.extraction import regex_extract, ai_extract, extract_from_pdf

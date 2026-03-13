@@ -1,4 +1,5 @@
 import streamlit as st
+import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db import get_deal, list_scenarios, upsert_scenario, delete_scenario, duplicate_scenario
 from models import LoanScenario
 from config import PREPAY_TYPES, FEE_DEFAULTS

@@ -1,7 +1,10 @@
 from __future__ import annotations
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import re
 import json
-import os
 import base64
 from models import LoanScenario
 
@@ -27,10 +30,6 @@ def _parse_dollars(s: str) -> float:
 
 
 def regex_extract(text: str) -> dict:
-    """
-    Extract loan fields from pasted text using regex.
-    Returns dict of field->value with a confidence dict.
-    """
     results = {}
     confidence = {}
 
@@ -48,7 +47,6 @@ def regex_extract(text: str) -> dict:
     _try(_RATE_RE, "rate_percent")
     _try(_POINTS_RE, "points_percent")
 
-    # Prepay: prefer explicit months, else convert years
     mp = _PREPAY_MONTHS_RE.search(text)
     if mp:
         results["prepay_months"] = int(mp.group(1))
@@ -60,7 +58,6 @@ def regex_extract(text: str) -> dict:
             results["prepay_months"] = val * 12 if val <= 10 else val
             confidence["prepay_months"] = "low"
 
-    # IO months: convert years if small number
     iom = _IO_RE.search(text)
     if iom:
         val = int(iom.group(1))
@@ -73,7 +70,6 @@ def regex_extract(text: str) -> dict:
     _try(_TITLE_RE, "title_fee", lambda x: _parse_dollars(x))
     _try(_CREDIT_RE, "lender_credit", lambda x: _parse_dollars(x))
 
-    # Prepay type
     if re.search(r"no[- ]*prepay", text, re.I):
         results["prepay_type"] = "none"
         results["prepay_months"] = 0
@@ -85,7 +81,6 @@ def regex_extract(text: str) -> dict:
         results["prepay_type"] = "flat"
         confidence["prepay_type"] = "medium"
 
-    # Lender / program names
     lm = _LENDER_RE.search(text)
     if lm:
         results["lender_name"] = lm.group(1).strip().rstrip(",")
@@ -129,7 +124,7 @@ JSON schema:
 
 Rules:
 - All dollar values as plain numbers (no $ or commas)
-- Prepay period always in months (convert years × 12)
+- Prepay period always in months (convert years x 12)
 - IO period always in months
 - If a field is not present in the text, return null for it
 - confidence object should rate each non-null field
@@ -137,10 +132,6 @@ Rules:
 
 
 def ai_extract(text: str) -> dict:
-    """
-    Call Anthropic API to extract loan fields from unstructured text.
-    Returns same format as regex_extract: {"fields": {...}, "confidence": {...}}
-    """
     try:
         import anthropic
         client = anthropic.Anthropic()
@@ -151,11 +142,9 @@ def ai_extract(text: str) -> dict:
             messages=[{"role": "user", "content": f"Extract loan fields from this text:\n\n{text}"}],
         )
         raw = response.content[0].text.strip()
-        # Strip any accidental markdown
         raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
         parsed = json.loads(raw)
         confidence = parsed.pop("confidence", {})
-        # Remove nulls
         fields = {k: v for k, v in parsed.items() if v is not None}
         return {"fields": fields, "confidence": confidence}
     except Exception as e:
@@ -164,11 +153,10 @@ def ai_extract(text: str) -> dict:
 
 def extract_from_pdf(pdf_bytes: bytes) -> dict:
     """
-    Extract loan fields from a PDF file using the Anthropic API vision capability.
-    Sends the PDF as a base64 document and returns same format as ai_extract.
-    Falls back to pdfminer text extraction + ai_extract if available.
+    Extract loan fields from a PDF using Anthropic API vision,
+    falling back to pdfminer then regex.
     """
-    # First try: send PDF directly to Claude as a document
+    # First try: Claude PDF vision
     try:
         import anthropic
         client = anthropic.Anthropic()
@@ -201,10 +189,10 @@ def extract_from_pdf(pdf_bytes: bytes) -> dict:
         confidence = parsed.pop("confidence", {})
         fields = {k: v for k, v in parsed.items() if v is not None}
         return {"fields": fields, "confidence": confidence, "method": "ai_pdf"}
-    except Exception as e:
+    except Exception:
         pass
 
-    # Second try: extract text with pdfminer and run ai_extract on the text
+    # Second try: pdfminer text extraction + ai_extract
     try:
         from pdfminer.high_level import extract_text_to_fp
         from pdfminer.layout import LAParams
@@ -221,7 +209,7 @@ def extract_from_pdf(pdf_bytes: bytes) -> dict:
     except Exception:
         pass
 
-    # Final fallback: regex on raw PDF text (crude but zero-dependency)
+    # Final fallback: regex on raw bytes
     try:
         raw_text = pdf_bytes.decode("latin-1", errors="ignore")
         result = regex_extract(raw_text)
@@ -231,11 +219,7 @@ def extract_from_pdf(pdf_bytes: bytes) -> dict:
         return {"fields": {}, "confidence": {}, "error": str(e), "method": "failed"}
 
 
-def merge_extraction_into_scenario(
-    base: LoanScenario,
-    extraction: dict,
-) -> LoanScenario:
-    """Apply extracted fields onto a base scenario, returning updated copy."""
+def merge_extraction_into_scenario(base: LoanScenario, extraction: dict) -> LoanScenario:
     fields = extraction.get("fields", {})
     data = base.model_dump()
     for k, v in fields.items():

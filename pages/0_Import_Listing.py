@@ -1,4 +1,5 @@
 import streamlit as st
+import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from services.listing_import import import_listing, estimate_insurance
 from db import upsert_deal
 from models import Deal
