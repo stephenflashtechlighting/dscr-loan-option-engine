@@ -1,12 +1,12 @@
 import streamlit as st
 from db import get_deal, upsert_scenario
 from models import LoanScenario
-from services.extraction import regex_extract, ai_extract, merge_extraction_into_scenario
+from services.extraction import regex_extract, ai_extract, extract_from_pdf
 from config import FEE_DEFAULTS, PREPAY_TYPES
 from ui_components import section_title, confidence_badge
 
 st.title("📥 Import Quote")
-st.caption("Paste an email, text message, or quote sheet and extract loan fields automatically.")
+st.caption("Import a loan quote from pasted text or a PDF file.")
 
 active_id = st.session_state.get("active_deal_id")
 if not active_id:
@@ -16,59 +16,102 @@ if not active_id:
 deal = get_deal(active_id)
 st.info(f"Importing into deal: **{deal.deal_name}**")
 
-# ── Step 1: Paste text ────────────────────────────────────────────────────────
-section_title("Step 1 — Paste quote text")
-raw_text = st.text_area(
-    "Paste the loan quote, email, or text message here",
-    height=200,
-    placeholder="Example:\nLender: First National DSCR\nRate: 7.25%\n2 points\n5-year declining prepayment penalty\nUnderwriting fee: $1,495\nProcessing: $895\nNo lender credit",
-)
-
-extraction_mode = st.radio(
-    "Extraction method",
-    ["AI extraction (Anthropic API)", "Regex only (faster, no API call)"],
-    horizontal=True,
-)
-use_ai = extraction_mode.startswith("AI")
+# ── Input method tabs ─────────────────────────────────────────────────────────
+tab1, tab2 = st.tabs(["📋 Paste text / email", "📄 Upload PDF"])
 
 if "extraction_result" not in st.session_state:
     st.session_state["extraction_result"] = None
 if "source_text" not in st.session_state:
     st.session_state["source_text"] = ""
+if "extraction_source_type" not in st.session_state:
+    st.session_state["extraction_source_type"] = "manual"
 
-if st.button("🔍 Extract fields", type="primary", disabled=not raw_text.strip()):
-    with st.spinner("Extracting..."):
-        if use_ai:
-            result = ai_extract(raw_text)
-            source_type = "ai_extracted"
-        else:
-            result = regex_extract(raw_text)
-            source_type = "extracted"
-        if "error" in result:
-            st.error(f"AI extraction error: {result['error']} — falling back to regex.")
-            result = regex_extract(raw_text)
-            source_type = "extracted"
+# ── Tab 1: Paste text ─────────────────────────────────────────────────────────
+with tab1:
+    section_title("Paste quote text")
+    raw_text = st.text_area(
+        "Paste the loan quote, email, or text message here",
+        height=200,
+        placeholder="Example:\nLender: First National DSCR\nRate: 7.25%\n2 points\n5-year declining prepayment penalty\nUnderwriting fee: $1,495\nProcessing: $895\nNo lender credit",
+        key="paste_text",
+    )
+    extraction_mode = st.radio(
+        "Extraction method",
+        ["AI extraction (Anthropic API)", "Regex only (faster, no API call)"],
+        horizontal=True,
+        key="text_mode",
+    )
+    use_ai = extraction_mode.startswith("AI")
+
+    if st.button("🔍 Extract from text", type="primary", disabled=not (raw_text or "").strip(), key="extract_text_btn"):
+        with st.spinner("Extracting..."):
+            if use_ai:
+                result = ai_extract(raw_text)
+                source_type = "ai_extracted"
+            else:
+                result = regex_extract(raw_text)
+                source_type = "extracted"
+            if "error" in result:
+                st.error(f"AI extraction error: {result['error']} — falling back to regex.")
+                result = regex_extract(raw_text)
+                source_type = "extracted"
         st.session_state["extraction_result"] = result
         st.session_state["extraction_source_type"] = source_type
         st.session_state["source_text"] = raw_text
+        st.rerun()
 
-# ── Step 2: Review and edit extracted fields ──────────────────────────────────
+# ── Tab 2: PDF upload ─────────────────────────────────────────────────────────
+with tab2:
+    section_title("Upload quote PDF")
+    st.caption("Upload a lender fee sheet, term sheet, or loan quote PDF. Claude will read it and extract loan fields.")
+
+    uploaded_file = st.file_uploader(
+        "Choose a PDF file",
+        type=["pdf"],
+        key="pdf_uploader",
+        help="Lender fee sheets, term sheets, loan estimates, or any quote document in PDF format."
+    )
+
+    if uploaded_file is not None:
+        st.success(f"File loaded: **{uploaded_file.name}** ({uploaded_file.size / 1024:.1f} KB)")
+
+        if st.button("🔍 Extract from PDF", type="primary", key="extract_pdf_btn"):
+            with st.spinner("Reading PDF and extracting loan fields..."):
+                pdf_bytes = uploaded_file.read()
+                result = extract_from_pdf(pdf_bytes)
+                source_type = "ai_extracted"
+                if "error" in result and not result.get("fields"):
+                    st.error(f"Extraction failed: {result['error']}")
+                else:
+                    method = result.get("method", "")
+                    if method == "ai_pdf":
+                        st.success("Extracted using Claude PDF vision.")
+                    elif "pdfminer" in method:
+                        st.success("Extracted text from PDF, then parsed with Claude.")
+                    else:
+                        st.warning("Used regex fallback — review all fields carefully.")
+                    st.session_state["extraction_result"] = result
+                    st.session_state["extraction_source_type"] = source_type
+                    st.session_state["source_text"] = f"[PDF: {uploaded_file.name}]"
+                    st.rerun()
+
+# ── Review form (shared for both methods) ─────────────────────────────────────
 result = st.session_state.get("extraction_result")
 if result is not None:
     fields = result.get("fields", {})
     confidence = result.get("confidence", {})
     source_type = st.session_state.get("extraction_source_type", "extracted")
-    source_label = "🤖 AI" if source_type == "ai_extracted" else "🔤 Regex"
+    method = result.get("method", "")
 
-    section_title("Step 2 — Review extracted fields")
-    st.caption(f"Source: {source_label}. Edit any field before saving. Confidence shown on the right.")
+    source_label = "🤖 AI" if source_type == "ai_extracted" else "🔤 Regex"
+    if "pdf" in method.lower():
+        source_label += " (PDF)"
+
+    section_title("Review extracted fields")
+    st.caption(f"Source: {source_label}. Edit any field before saving. Confidence shown in tooltips.")
 
     if not fields:
         st.warning("No fields were automatically extracted. Fill in the form below manually.")
-
-    def _conf(key):
-        level = confidence.get(key, "low")
-        return confidence_badge(level)
 
     with st.form("review_form"):
         col1, col2 = st.columns(2)
@@ -119,11 +162,19 @@ if result is not None:
             title_fee = st.number_input("Title fee ($)", value=float(fields.get("title_fee", FEE_DEFAULTS["title_fee"])), min_value=0.0, step=50.0)
             credit = st.number_input("Lender credit ($)", value=float(fields.get("lender_credit", 0.0)), min_value=0.0, step=100.0)
 
-        notes = st.text_area("Notes (optional)", height=60,
-                              value=fields.get("notes", f"Imported via {source_label} extraction"))
+        notes = st.text_area(
+            "Notes (optional)",
+            height=60,
+            value=fields.get("notes", f"Imported via {source_label}")
+        )
 
         st.caption("⚠️ Always verify extracted values against the original lender document before using for decisions.")
-        save = st.form_submit_button("✅ Save as scenario", type="primary")
+
+        col_save, col_clear = st.columns([1, 4])
+        with col_save:
+            save = st.form_submit_button("✅ Save as scenario", type="primary")
+        with col_clear:
+            clear = st.form_submit_button("🗑 Clear and start over")
 
     if save:
         if not lender_name:
@@ -153,3 +204,8 @@ if result is not None:
             st.session_state["extraction_result"] = None
             st.session_state["source_text"] = ""
             st.success(f"Scenario #{sid} saved! Go to the **Comparison Dashboard** to compare.")
+
+    if clear:
+        st.session_state["extraction_result"] = None
+        st.session_state["source_text"] = ""
+        st.rerun()

@@ -2,6 +2,7 @@ from __future__ import annotations
 import re
 import json
 import os
+import base64
 from models import LoanScenario
 
 
@@ -159,6 +160,75 @@ def ai_extract(text: str) -> dict:
         return {"fields": fields, "confidence": confidence}
     except Exception as e:
         return {"fields": {}, "confidence": {}, "error": str(e)}
+
+
+def extract_from_pdf(pdf_bytes: bytes) -> dict:
+    """
+    Extract loan fields from a PDF file using the Anthropic API vision capability.
+    Sends the PDF as a base64 document and returns same format as ai_extract.
+    Falls back to pdfminer text extraction + ai_extract if available.
+    """
+    # First try: send PDF directly to Claude as a document
+    try:
+        import anthropic
+        client = anthropic.Anthropic()
+        pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1000,
+            system=_AI_SYSTEM,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": pdf_b64,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": "Extract all loan scenario fields from this document. Return only JSON.",
+                    },
+                ],
+            }],
+        )
+        raw = response.content[0].text.strip()
+        raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+        parsed = json.loads(raw)
+        confidence = parsed.pop("confidence", {})
+        fields = {k: v for k, v in parsed.items() if v is not None}
+        return {"fields": fields, "confidence": confidence, "method": "ai_pdf"}
+    except Exception as e:
+        pass
+
+    # Second try: extract text with pdfminer and run ai_extract on the text
+    try:
+        from pdfminer.high_level import extract_text_to_fp
+        from pdfminer.layout import LAParams
+        import io
+        output = io.StringIO()
+        extract_text_to_fp(io.BytesIO(pdf_bytes), output, laparams=LAParams())
+        text = output.getvalue().strip()
+        if text:
+            result = ai_extract(text)
+            result["method"] = "pdfminer+ai"
+            return result
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # Final fallback: regex on raw PDF text (crude but zero-dependency)
+    try:
+        raw_text = pdf_bytes.decode("latin-1", errors="ignore")
+        result = regex_extract(raw_text)
+        result["method"] = "regex_pdf"
+        return result
+    except Exception as e:
+        return {"fields": {}, "confidence": {}, "error": str(e), "method": "failed"}
 
 
 def merge_extraction_into_scenario(
