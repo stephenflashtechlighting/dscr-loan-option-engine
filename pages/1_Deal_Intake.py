@@ -91,5 +91,12 @@ if existing:
     col_a, col_b, col_c, col_d = st.columns(4)
     col_a.metric("Loan amount", f"${la:,.0f}")
     col_b.metric("Monthly TI", f"${ti:,.0f}")
-    col_c.metric("GRM", f"{existing.purchase_price / (existing.monthly_rent * 12):.1f}x")
-    col_d.metric("Gross yield", f"{existing.monthly_rent * 12 / existing.purchase_price * 100:.2f}%")
+    annual_rent = (existing.monthly_rent or 0) * 12
+    if annual_rent > 0:
+        col_c.metric("GRM", f"{existing.purchase_price / annual_rent:.1f}x")
+    else:
+        col_c.metric("GRM", "—")
+    if existing.purchase_price > 0 and annual_rent > 0:
+        col_d.metric("Gross yield", f"{annual_rent / existing.purchase_price * 100:.2f}%")
+    else:
+        col_d.metric("Gross yield", "—")

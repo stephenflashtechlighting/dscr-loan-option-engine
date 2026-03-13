@@ -80,7 +80,9 @@ with tab2:
                     st.error(result["error"])
                 else:
                     method = result.get("method", "")
-                    if method == "pdf_text+ai":
+                    if method == "pdf_text+targeted":
+                        st.success("Extracted from readable PDF text using the targeted loan-document parser.")
+                    elif method == "pdf_text+ai":
                         st.success("Extracted from readable PDF text using AI.")
                     elif method == "pdf_text+regex":
                         st.warning("Extracted from readable PDF text using regex only — verify every field before saving.")
@@ -144,9 +146,8 @@ if result is not None:
 
     if save:
         if not lender_name:
-            st.error("Lender name is required.")
-        else:
-            scenario = LoanScenario(
+            lender_name = "Imported quote"
+        scenario = LoanScenario(
                 deal_id=active_id,
                 lender_name=lender_name,
                 program_name=program_name,
@@ -166,10 +167,10 @@ if result is not None:
                 source_type=source_type,
                 source_text=st.session_state.get("source_text", "")[:4000],
             )
-            sid = upsert_scenario(scenario)
-            st.session_state["extraction_result"] = None
-            st.session_state["source_text"] = ""
-            st.success(f"Scenario #{sid} saved! Go to the **Comparison Dashboard** to compare.")
+        sid = upsert_scenario(scenario)
+        st.session_state["extraction_result"] = None
+        st.session_state["source_text"] = ""
+        st.success(f"Scenario #{sid} saved! Go to the **Comparison Dashboard** to compare.")
 
     if clear:
         st.session_state["extraction_result"] = None

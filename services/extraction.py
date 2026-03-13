@@ -1,5 +1,4 @@
 from __future__ import annotations
-import base64
 import io
 import json
 import re
@@ -24,11 +23,12 @@ _PROGRAM_RE = re.compile(r"(?:program|product|loan\s*program)\s*[:\-]?\s*([A-Za-
 MORTGAGE_KEYWORDS = [
     "rate", "interest only", "loan term", "amortization", "prepay", "underwriting",
     "processing fee", "appraisal", "title", "lender credit", "dscr", "term sheet", "quote",
+    "loan estimate", "projected payments", "origination charges", "cash to close", "closing cost details",
 ]
 
 
 def _parse_dollars(s: str) -> float:
-    return float(s.replace(",", "").strip())
+    return float(s.replace(",", "").replace("$", "").strip())
 
 
 def _to_months(raw: str, match_text: str) -> int:
@@ -38,9 +38,34 @@ def _to_months(raw: str, match_text: str) -> int:
 
 def clean_extracted_text(text: str) -> str:
     text = text.replace("\x00", " ")
+    text = text.replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def normalize_pdf_text(text: str) -> str:
+    text = clean_extracted_text(text)
+    # Join label/value pairs often split across lines in PDF extraction.
+    lines = [ln.strip() for ln in text.splitlines()]
+    merged: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not line:
+            i += 1
+            continue
+        nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+        if nxt and len(line) <= 40 and len(nxt) <= 40:
+            label_like = bool(re.search(r"(rate|term|amort|prepay|points|origination|underwriting|processing|appraisal|title|credit|lender|loan type|interest only)", line, re.I))
+            value_like = bool(re.fullmatch(r"(?:\$?[\d,]+(?:\.\d+)?%?|YES|NO|Conventional|DSCR|Fixed|ARM|\d+\s*(?:years?|months?))", nxt, re.I))
+            if label_like and value_like:
+                merged.append(f"{line}: {nxt}")
+                i += 2
+                continue
+        merged.append(line)
+        i += 1
+    return "\n".join(merged)
 
 
 def is_likely_loan_quote(text: str) -> bool:
@@ -49,8 +74,93 @@ def is_likely_loan_quote(text: str) -> bool:
     return hits >= 3
 
 
+def _extract_label_value(lines: list[str], labels: list[str], value_pattern: str) -> str | None:
+    for i, line in enumerate(lines):
+        lowered = line.lower()
+        if not any(label.lower() in lowered for label in labels):
+            continue
+        # same-line match first
+        m = re.search(value_pattern, line, re.I)
+        if m:
+            return m.group(1)
+        # nearby lines next
+        for j in range(i + 1, min(i + 4, len(lines))):
+            m = re.search(value_pattern, lines[j], re.I)
+            if m:
+                return m.group(1)
+    return None
+
+
+def _loan_estimate_extract(text: str) -> dict:
+    """Extra parser for common Loan Estimate / fee sheet layouts."""
+    lines = [ln.strip() for ln in normalize_pdf_text(text).splitlines() if ln.strip()]
+    results: dict = {}
+    confidence: dict = {}
+
+    def set_num(key: str, raw: str | None, pct: bool = False, months=False):
+        if raw is None:
+            return
+        try:
+            value = raw.strip()
+            if months:
+                value_num = _to_months(re.search(r"(\d+)", value).group(1), value)
+            else:
+                value_num = _parse_dollars(value) if not pct else float(value.replace(",", "").replace("%", "").strip())
+            results[key] = value_num
+            confidence[key] = "medium"
+        except Exception:
+            pass
+
+    set_num("rate_percent", _extract_label_value(lines, ["Interest Rate", "Note Rate", "rate"], r"([0-9]{1,2}(?:\.[0-9]{1,3})?)\s*%"), pct=True)
+    set_num("loan_term_months", _extract_label_value(lines, ["Loan Term", "Term"], r"(\d+\s*(?:years?|months?))"), months=True)
+    set_num("amortization_months", _extract_label_value(lines, ["Amortization", "Amortized Over"], r"(\d+\s*(?:years?|months?))"), months=True)
+    set_num("interest_only_months", _extract_label_value(lines, ["Interest Only", "I/O"], r"(\d+\s*(?:years?|months?))"), months=True)
+    set_num("underwriting_fee", _extract_label_value(lines, ["Underwriting", "Underwriting Fee"], r"\$\s*([\d,]+(?:\.\d+)?)"))
+    set_num("processing_fee", _extract_label_value(lines, ["Processing", "Processing Fee", "Administrative Fee"], r"\$\s*([\d,]+(?:\.\d+)?)"))
+    set_num("appraisal_fee", _extract_label_value(lines, ["Appraisal", "Appraisal Fee"], r"\$\s*([\d,]+(?:\.\d+)?)"))
+    set_num("title_fee", _extract_label_value(lines, ["Title", "Settlement", "Closing Fee"], r"\$\s*([\d,]+(?:\.\d+)?)"))
+    set_num("lender_credit", _extract_label_value(lines, ["Lender Credit", "Credit"], r"\$\s*([\d,]+(?:\.\d+)?)"))
+
+    # Points often appear as "% of Loan Amount (Points)".
+    points_val = _extract_label_value(lines, ["Points", "% of Loan Amount (Points)", "Origination Charges"], r"([0-9]{1,2}(?:\.[0-9]{1,3})?)\s*%")
+    if points_val is not None:
+        set_num("points_percent", points_val, pct=True)
+    else:
+        # Sometimes points are only shown as a dollar amount. If line contains both points and dollar figure,
+        # leave it for manual review rather than inventing a percent.
+        pass
+
+    prepay_line = _extract_label_value(lines, ["Prepayment Penalty"], r"\b(YES|NO)\b")
+    if prepay_line:
+        if prepay_line.upper() == "NO":
+            results["prepay_type"] = "none"
+            results["prepay_months"] = 0
+            confidence["prepay_type"] = "high"
+            confidence["prepay_months"] = "high"
+        else:
+            # Find an accompanying term in nearby lines.
+            prepay_term = _extract_label_value(lines, ["Prepayment Penalty", "Prepayment"], r"(\d+\s*(?:years?|months?))")
+            if prepay_term:
+                results["prepay_months"] = _to_months(re.search(r"(\d+)", prepay_term).group(1), prepay_term)
+                confidence["prepay_months"] = "medium"
+            results.setdefault("prepay_type", "declining")
+            confidence.setdefault("prepay_type", "low")
+
+    lender_name = _extract_label_value(lines, ["Lender"], r"Lender\s*:?\s*(.+)$")
+    if lender_name and len(lender_name.split()) <= 12:
+        results["lender_name"] = lender_name.strip()
+        confidence["lender_name"] = "medium"
+
+    loan_type = _extract_label_value(lines, ["Loan Type"], r"Loan Type\s*:?\s*(.+)$")
+    if loan_type:
+        results["program_name"] = loan_type.strip()
+        confidence["program_name"] = "low"
+
+    return {"fields": results, "confidence": confidence, "clean_text": normalize_pdf_text(text)}
+
+
 def regex_extract(text: str) -> dict:
-    text = clean_extracted_text(text)
+    text = normalize_pdf_text(text)
     results = {}
     confidence = {}
 
@@ -93,10 +203,11 @@ def regex_extract(text: str) -> dict:
     _try(_CREDIT_RE, "lender_credit", lambda x, _: _parse_dollars(x))
 
     lowered = text.lower()
-    if re.search(r"no[- ]*prepay|no\s+prepayment\s+penalty", lowered, re.I):
+    if re.search(r"no[- ]*prepay|no\s+prepayment\s+penalty|prepayment penalty\s*:?\s*no\b", lowered, re.I):
         results["prepay_type"] = "none"
         results["prepay_months"] = 0
         confidence["prepay_type"] = "high"
+        confidence["prepay_months"] = "high"
     elif re.search(r"declin", lowered, re.I):
         results["prepay_type"] = "declining"
         confidence["prepay_type"] = "medium"
@@ -115,6 +226,13 @@ def regex_extract(text: str) -> dict:
     if pm:
         results["program_name"] = pm.group(1).strip()
         confidence["program_name"] = "low"
+
+    # Supplement with loan-estimate-style parsing for missed fields.
+    le_result = _loan_estimate_extract(text)
+    for key, value in le_result.get("fields", {}).items():
+        results.setdefault(key, value)
+    for key, value in le_result.get("confidence", {}).items():
+        confidence.setdefault(key, value)
 
     return {"fields": results, "confidence": confidence, "clean_text": text}
 
@@ -155,7 +273,7 @@ Rules:
 
 
 def ai_extract(text: str) -> dict:
-    text = clean_extracted_text(text)
+    text = normalize_pdf_text(text)
     try:
         import anthropic
         client = anthropic.Anthropic()
@@ -178,7 +296,7 @@ def ai_extract(text: str) -> dict:
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     from pdfminer.high_level import extract_text
     text = extract_text(io.BytesIO(pdf_bytes))
-    return clean_extracted_text(text)
+    return normalize_pdf_text(text)
 
 
 def extract_from_pdf(pdf_bytes: bytes) -> dict:
@@ -199,10 +317,20 @@ def extract_from_pdf(pdf_bytes: bytes) -> dict:
             "clean_text": text,
         }
 
-    # First try AI on extracted text; if that fails, use regex on cleaned text only.
+    # First try targeted parsers, then AI, then broader regex.
+    targeted = _loan_estimate_extract(text)
+    targeted["method"] = "pdf_text+targeted"
+    if len(targeted.get("fields", {})) >= 3:
+        return targeted
+
     ai_result = ai_extract(text)
     ai_result["method"] = "pdf_text+ai"
     if ai_result.get("fields"):
+        # backfill any obvious misses from targeted extraction
+        for k, v in targeted.get("fields", {}).items():
+            ai_result["fields"].setdefault(k, v)
+        for k, v in targeted.get("confidence", {}).items():
+            ai_result["confidence"].setdefault(k, v)
         return ai_result
 
     regex_result = regex_extract(text)

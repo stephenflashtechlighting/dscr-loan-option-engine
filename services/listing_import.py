@@ -17,7 +17,6 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-
 CRITICAL_FIELDS = ("purchase_price", "address", "annual_taxes")
 
 
@@ -41,6 +40,15 @@ def _clean_price(s: str) -> Optional[float]:
         return None
 
 
+def _visible_text(html: str) -> str:
+    text = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.I | re.S)
+    text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"&nbsp;", " ", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
 def _extract_json_ld(html: str) -> dict:
     pattern = re.compile(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.S)
     for m in pattern.finditer(html):
@@ -57,23 +65,78 @@ def _extract_json_ld(html: str) -> dict:
     return {}
 
 
-def _extract_tax_value(text: str) -> Optional[float]:
+def _extract_labeled_currency(text: str, labels: list[str]) -> Optional[float]:
+    labels_re = "|".join(re.escape(label) for label in labels)
     patterns = [
-        r'(?:property\s*tax(?:es)?|annual\s*tax(?:es)?|taxes)[^\d$]{0,50}\$\s*([\d,]+)',
-        r'"taxAnnualAmount"\s*:\s*"?([\d,]+(?:\.\d+)?)"?',
-        r'"propertyTaxRate"\s*:\s*"?([\d,]+(?:\.\d+)?)"?',
-        r'"tax"\s*:\s*([\d,]+(?:\.\d+)?)',
-        r'"taxes"\s*:\s*\{[^\}]{0,120}?"total"\s*:\s*([\d,]+(?:\.\d+)?)',
+        rf"(?:{labels_re})\s*[:\-]?\s*\$\s*([\d,]+(?:\.\d+)?)",
+        rf"(?:{labels_re})[^\d$]{{0,20}}\$\s*([\d,]+(?:\.\d+)?)",
+        rf"(?:{labels_re})\s*(?:for\s*\d{{4}})?\s*[:\-]?\s*([\d,]+(?:\.\d+)?)",
     ]
     for pattern in patterns:
         m = re.search(pattern, text, re.I | re.S)
         if m:
             try:
                 val = float(m.group(1).replace(",", ""))
-                if 100 <= val <= 200000:
+                if 1 <= val <= 200000:
                     return val
             except Exception:
                 pass
+    return None
+
+
+def _extract_trulia_tax_table(html: str) -> Optional[float]:
+    visible = _visible_text(html)
+    direct = _extract_labeled_currency(visible, ["Tax", "Taxes", "Property Tax", "Annual Tax"])
+    if direct is not None:
+        return direct
+
+    for pattern in [
+        r"Year\s*\d{4}\s*Tax\s*\$\s*([\d,]+(?:\.\d+)?)\s*Assessment",
+        r"Tax\s*\$\s*([\d,]+(?:\.\d+)?)\s*Assessment",
+        r"Tax\s*([\d,]+(?:\.\d+)?)\s*Assessment",
+    ]:
+        m = re.search(pattern, visible, re.I | re.S)
+        if m:
+            try:
+                val = float(m.group(1).replace(",", ""))
+                if 1 <= val <= 200000:
+                    return val
+            except Exception:
+                pass
+    return None
+
+
+def _extract_tax_value(text: str) -> Optional[float]:
+    visible = _visible_text(text)
+
+    direct = _extract_labeled_currency(
+        visible,
+        ["Tax", "Taxes", "Property Tax", "Property Taxes", "Annual Tax", "Annual Taxes"],
+    )
+    if direct is not None:
+        return direct
+
+    patterns = [
+        r'(?:property\s*tax(?:es)?|annual\s*tax(?:es)?|taxes|\btax\b)[^\d$]{0,50}\$\s*([\d,]+(?:\.\d+)?)',
+        r'"taxAnnualAmount"\s*:\s*"?([\d,]+(?:\.\d+)?)"?',
+        r'"propertyTaxRate"\s*:\s*"?([\d,]+(?:\.\d+)?)"?',
+        r'"tax"\s*:\s*([\d,]+(?:\.\d+)?)',
+        r'"taxes"\s*:\s*\{[^\}]{0,120}?"total"\s*:\s*([\d,]+(?:\.\d+)?)',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, re.I | re.S) or re.search(pattern, visible, re.I | re.S)
+        if m:
+            try:
+                val = float(m.group(1).replace(",", ""))
+                if 1 <= val <= 200000:
+                    return val
+            except Exception:
+                pass
+
+    trulia_val = _extract_trulia_tax_table(text)
+    if trulia_val is not None:
+        return trulia_val
+
     return None
 
 
@@ -87,6 +150,7 @@ def _parse_zillow(html: str, url: str) -> dict:
             home = props.get("componentProps", {}).get("gdpClientCache") or props.get("initialReduxState", {})
             if isinstance(home, str):
                 home = json.loads(home)
+
             def _walk(obj, depth=0):
                 if depth > 8 or not isinstance(obj, dict):
                     return
@@ -104,6 +168,7 @@ def _parse_zillow(html: str, url: str) -> dict:
                         result.setdefault("city_state_zip", f"{city}, {state} {zip_}".strip())
                 for v in obj.values():
                     _walk(v, depth + 1)
+
             _walk(home)
         except Exception:
             pass
@@ -120,7 +185,7 @@ def _parse_zillow(html: str, url: str) -> dict:
                 result["purchase_price"] = p
     if "annual_taxes" not in result:
         tax = _extract_tax_value(html)
-        if tax:
+        if tax is not None:
             result["annual_taxes"] = tax
     if "address" not in result:
         m = re.search(r'zillow\.com/homedetails/([^/]+)/', url)
@@ -141,7 +206,7 @@ def _parse_redfin(html: str, url: str) -> dict:
         if m:
             result["purchase_price"] = float(m.group(1))
     tax = _extract_tax_value(html)
-    if tax:
+    if tax is not None:
         result["annual_taxes"] = tax
     m = re.search(r'"streetAddress"\s*:\s*"([^"]+)"', html)
     if m:
@@ -195,7 +260,7 @@ def _parse_realtor(html: str, url: str) -> dict:
             result["purchase_price"] = float(m.group(1))
     if "annual_taxes" not in result:
         tax = _extract_tax_value(html)
-        if tax:
+        if tax is not None:
             result["annual_taxes"] = tax
     return result
 
@@ -239,8 +304,8 @@ def _parse_trulia(html: str, url: str) -> dict:
         result["address"] = addr["streetAddress"]
         result["city_state_zip"] = f"{addr.get('addressLocality','')}, {addr.get('addressRegion','')} {addr.get('postalCode','')}".strip()
 
-    tax = _extract_tax_value(html)
-    if tax:
+    tax = _extract_trulia_tax_table(html) or _extract_tax_value(html)
+    if tax is not None:
         result["annual_taxes"] = tax
 
     if "purchase_price" not in result:
@@ -280,7 +345,7 @@ def _parse_generic(html: str, url: str) -> dict:
                     result["purchase_price"] = p
                     break
     tax = _extract_tax_value(html)
-    if tax:
+    if tax is not None:
         result["annual_taxes"] = tax
     return result
 
@@ -416,7 +481,8 @@ def import_listing(url: str, use_ai_fallback: bool = True) -> dict:
     result["source_url"] = url
     found_fields = [k for k in CRITICAL_FIELDS if result.get(k)]
     result["confidence"] = "high" if len(found_fields) == 3 else "medium" if len(found_fields) >= 1 else "low"
-    if missing_critical and not result.get("annual_taxes"):
-        result.setdefault("warnings", []).append("Taxes could not be reliably extracted. Verify against the county or listing page.")
-
+    if not result.get("annual_taxes"):
+        result.setdefault("warnings", []).append(
+            "Tax field may be visible on the listing page, but the current parser did not match it reliably. Verify against the listing or county record."
+        )
     return result

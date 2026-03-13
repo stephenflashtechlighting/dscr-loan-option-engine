@@ -56,4 +56,4 @@ OBJECTIVE_MODE_LABELS = {
 PREPAY_TYPES = ["declining", "flat", "none"]
 
 APP_TITLE = "DSCR Loan Option Engine"
-APP_VERSION = "2.6"
+APP_VERSION = "2.7"

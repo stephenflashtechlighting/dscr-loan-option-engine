@@ -1,4 +1,4 @@
-# DSCR Loan Option Engine v2.6
+# DSCR Loan Option Engine v2.7
 
 Decision-support software for normalizing investor loan quotes, generating hold-period-aware comparisons, and exporting borrower-ready decision memos.
 
@@ -17,7 +17,7 @@ streamlit run app.py
 | 📋 Deal Intake | Create or edit a deal with property economics and borrower intent |
 | 🔢 Scenario Builder | Add, edit, copy, and delete loan scenarios |
 | 📊 Comparison Dashboard | Ranked scenarios, recommendation cards, breakeven, exports |
-| 📥 Import Quote | Paste email/text — regex or AI extraction with review workflow |
+| 📥 Import Quote | Paste email/text or upload PDF — targeted, regex, or AI extraction with review workflow |
 | ⚙️ Settings | Persist fee defaults and scoring weight presets |
 
 ## AI extraction
