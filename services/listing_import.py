@@ -208,7 +208,249 @@ def _parse_realtor(html: str, url: str) -> dict:
     return result
 
 
-def _parse_generic(html: str, url: str) -> dict:
+def _parse_trulia(html: str, url: str) -> dict:
+    result = {}
+
+    # ── 1. Walk __NEXT_DATA__ JSON with full deep recursion ───────────────────
+    nd = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if nd:
+        try:
+            data = json.loads(nd.group(1))
+
+            def _walk(obj, depth=0):
+                if depth > 20:
+                    return
+                if isinstance(obj, dict):
+                    # Price
+                    for price_key in ("listingPrice", "price", "listPrice", "formattedPrice"):
+                        v = obj.get(price_key)
+                        if isinstance(v, (int, float)) and v > 50000:
+                            result.setdefault("purchase_price", float(v))
+                        elif isinstance(v, dict):
+                            amt = v.get("amount") or v.get("value")
+                            if amt:
+                                try:
+                                    cleaned = float(str(amt).replace(",","").replace("$",""))
+                                    if cleaned > 50000:
+                                        result.setdefault("purchase_price", cleaned)
+                                except Exception:
+                                    pass
+                        elif isinstance(v, str):
+                            cleaned = _clean_price(v)
+                            if cleaned and cleaned > 50000:
+                                result.setdefault("purchase_price", cleaned)
+
+                    # Taxes
+                    for tax_key in ("taxAnnualAmount", "annualTaxAmount", "annualTaxes",
+                                    "propertyTaxes", "taxAmount", "yearlyTaxes"):
+                        v = obj.get(tax_key)
+                        if v is not None:
+                            try:
+                                val = float(str(v).replace(",", "").replace("$", "").strip())
+                                if 100 <= val <= 100000:
+                                    result.setdefault("annual_taxes", val)
+                            except Exception:
+                                pass
+                    # taxes nested object
+                    if "taxes" in obj and isinstance(obj["taxes"], dict):
+                        for tk in ("annualAmount", "amount", "annual"):
+                            v = obj["taxes"].get(tk)
+                            if v is not None:
+                                try:
+                                    val = float(str(v).replace(",", "").replace("$", ""))
+                                    if 100 <= val <= 100000:
+                                        result.setdefault("annual_taxes", val)
+                                except Exception:
+                                    pass
+
+                    # Address
+                    if obj.get("streetAddress"):
+                        result.setdefault("address", obj["streetAddress"])
+                    if obj.get("city") and obj.get("state"):
+                        zipcode = obj.get("zip") or obj.get("zipCode") or obj.get("postalCode") or ""
+                        result.setdefault("city_state_zip", f"{obj['city']}, {obj['state']} {zipcode}".strip())
+
+                    # Beds / baths / sqft / year
+                    for k, rk in (("bedrooms","beds"), ("beds","beds"), ("bathrooms","baths"), ("baths","baths")):
+                        if obj.get(k):
+                            result.setdefault(rk, obj[k])
+                    for k in ("livingArea", "squareFeet", "floorSize", "sqft"):
+                        if obj.get(k):
+                            try:
+                                result.setdefault("sqft", int(float(str(obj[k]).replace(",",""))))
+                            except Exception:
+                                pass
+                    if obj.get("yearBuilt"):
+                        result.setdefault("year_built", obj["yearBuilt"])
+
+                    for v in obj.values():
+                        _walk(v, depth + 1)
+                elif isinstance(obj, list):
+                    for item in obj:
+                        _walk(item, depth + 1)
+
+            _walk(data)
+        except Exception:
+            pass
+
+    # ── 2. Raw JSON string regex ──────────────────────────────────────────────
+    if "annual_taxes" not in result:
+        for pattern in [
+            r'"taxAnnualAmount"\s*:\s*"?([\d,.]+)"?',
+            r'"annualTaxAmount"\s*:\s*"?([\d,.]+)"?',
+            r'"annualTaxes"\s*:\s*"?([\d,.]+)"?',
+            r'"yearlyTaxes"\s*:\s*"?([\d,.]+)"?',
+            r'"taxAmount"\s*:\s*"?([\d,.]+)"?',
+        ]:
+            m = re.search(pattern, html, re.I)
+            if m:
+                try:
+                    val = float(m.group(1).replace(",", ""))
+                    if 100 <= val <= 100000:
+                        result["annual_taxes"] = val
+                        break
+                except Exception:
+                    pass
+
+    # ── 3. Trulia "Property Tax and Assessment" section ──────────────────────
+    # Trulia renders taxes in a table under a heading with data-testid="styled-section-container-heading"
+    if "annual_taxes" not in result:
+        tax_section = re.search(
+            r'Property Tax and Assessment.{0,2000}?</table>',
+            html, re.S | re.I
+        )
+        if tax_section:
+            # Find dollar amounts inside that table
+            amounts = re.findall(r'\$\s*([\d,]+)', tax_section.group())
+            for amt in amounts:
+                try:
+                    val = float(amt.replace(",", ""))
+                    if 100 <= val <= 50000:
+                        result["annual_taxes"] = val
+                        break
+                except Exception:
+                    pass
+
+    # ── 4. Rendered HTML text regex ───────────────────────────────────────────
+    if "annual_taxes" not in result:
+        for pattern in [
+            r'tax[^$\d]{0,30}\$\s*([\d,]+)\s*/\s*(?:per\s+)?year',
+            r'\$\s*([\d,]+)\s*/\s*(?:per\s+)?year[^a-z]{0,20}tax',
+            r'[Pp]roperty\s+[Tt]ax(?:es)?[^$\d]{0,20}\$\s*([\d,]+)',
+            r'[Aa]nnual\s+[Tt]ax(?:es)?[^$\d]{0,20}\$\s*([\d,]+)',
+            r'[Tt]ax\s+[Aa]nnual[^$\d]{0,20}\$?\s*([\d,]+)',
+        ]:
+            m = re.search(pattern, html, re.I | re.S)
+            if m:
+                try:
+                    val = float(m.group(1).replace(",", ""))
+                    if 100 <= val <= 100000:
+                        result["annual_taxes"] = val
+                        break
+                except Exception:
+                    pass
+
+    # ── 5. Address fallback ───────────────────────────────────────────────────
+    if "address" not in result:
+        m = re.search(r'"streetAddress"\s*:\s*"([^"]+)"', html)
+        if m:
+            result["address"] = m.group(1)
+        m2 = re.search(r'"addressLocality"\s*:\s*"([^"]+)"', html)
+        m3 = re.search(r'"addressRegion"\s*:\s*"([^"]+)"', html)
+        m4 = re.search(r'"postalCode"\s*:\s*"([^"]+)"', html)
+        if m2 and m3:
+            result["city_state_zip"] = f"{m2.group(1)}, {m3.group(1)} {m4.group(1) if m4 else ''}".strip()
+
+    # ── 6. Price fallback ─────────────────────────────────────────────────────
+    if "purchase_price" not in result:
+        for pattern in [
+            r'"listingPrice"\s*:\s*\{"amount"\s*:\s*(\d+)',
+            r'"price"\s*:\s*(\d{5,9})',
+        ]:
+            m = re.search(pattern, html)
+            if m:
+                p = _clean_price(m.group(1))
+                if p and p > 50000:
+                    result["purchase_price"] = p
+                    break
+
+    # ── 7. Tax last-resort: scan ALL numeric values adjacent to "tax" in raw HTML ──
+    if "annual_taxes" not in result:
+        # Try JSON-LD structured data first
+        jld = _extract_json_ld(html)
+        for tk in ("taxAnnualAmount", "annualTaxAmount", "propertyTaxes", "taxes"):
+            v = jld.get(tk)
+            if v is not None:
+                try:
+                    val = float(str(v).replace(",", "").replace("$", ""))
+                    if 100 <= val <= 100000:
+                        result["annual_taxes"] = val
+                        break
+                except Exception:
+                    pass
+
+    if "annual_taxes" not in result:
+        # Broaden to catch any pattern like: "tax": 2400 or tax_amount: "2,400"
+        for pattern in [
+            r'"(?:tax|taxes|taxAmount|annualTax|yearlyTax|propertyTax)[^"]*"\s*:\s*"?([\d,]+\.?\d*)"?',
+            r'(?:annual|yearly|property)\s+tax(?:es)?\s*[:\-$]\s*([\d,]+)',
+            r'taxes\s*\(annual\)[:\s$]*([\d,]+)',
+            r'"amount"\s*:\s*([\d.]+)[^}]*"tax',   # amount before "tax" in same object
+        ]:
+            m = re.search(pattern, html, re.I)
+            if m:
+                try:
+                    val = float(m.group(1).replace(",", ""))
+                    if 100 <= val <= 100000:
+                        result["annual_taxes"] = val
+                        break
+                except Exception:
+                    pass
+
+    # ── 8. Store debug info so UI can show what keys were found ───────────────
+    try:
+        nd2 = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+        if nd2:
+            raw_json = nd2.group(1)
+            # Collect all keys that contain "tax" anywhere
+            tax_keys_found = list(set(re.findall(r'"([^"]*[Tt]ax[^"]*)"', raw_json)))[:20]
+            result["_debug_tax_keys"] = tax_keys_found
+            # Collect all tax key:value pairs
+            tax_pairs = re.findall(r'"([^"]*[Tt]ax[^"]*)":\s*([^,}\]]{1,60})', raw_json)
+            result["_debug_tax_pairs"] = [f"{k}: {v.strip()}" for k, v in tax_pairs[:15]]
+    except Exception:
+        pass
+
+    # ── 9. AI extraction for taxes — last resort when all regex failed ────────
+    if "annual_taxes" not in result:
+        try:
+            import anthropic
+            client = anthropic.Anthropic()
+            stripped = re.sub(r'<[^>]+>', ' ', html)
+            stripped = re.sub(r'\s+', ' ', stripped)
+            tax_windows = [m.group() for m in re.finditer(r'.{0,200}[Tt]ax.{0,200}', stripped)]
+            snippet = ' | '.join(tax_windows[:10])[:3000] if tax_windows else stripped[:3000]
+            resp = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=100,
+                messages=[{"role": "user", "content": (
+                    "From this real estate listing text, find the annual property tax amount in dollars. "
+                    "Return ONLY a plain number like 2400. If not found, return null.\n\n" + snippet
+                )}],
+            )
+            raw_tax = resp.content[0].text.strip()
+            if raw_tax.lower() != "null":
+                val = float(raw_tax.replace(",", "").replace("$", "").strip())
+                if 100 <= val <= 100000:
+                    result["annual_taxes"] = val
+        except Exception:
+            pass
+
+    return result
+
+
+
+
     """Generic fallback using JSON-LD and regex."""
     result = {}
     jld = _extract_json_ld(html)
@@ -240,67 +482,67 @@ def _parse_generic(html: str, url: str) -> dict:
 
 # ── AI-assisted extraction fallback ───────────────────────────────────────────
 
-def ai_extract_listing(html_snippet: str) -> dict:
+def ai_extract_listing(text_or_html: str) -> dict:
     """
-    Use Anthropic API to extract deal fields from a listing page snippet.
-    Called only when regex parsing yields incomplete results.
+    Use Anthropic API to extract deal fields from pasted listing text or HTML.
+    Returns a flat dict with normalized field names.
     """
     try:
         import anthropic
         client = anthropic.Anthropic()
 
-        # Trim HTML to a reasonable size — strip tags first
-        text = re.sub(r'<[^>]+>', ' ', html_snippet)
-        text = re.sub(r'\s+', ' ', text).strip()[:6000]
+        # Strip HTML tags, collapse whitespace
+        text = re.sub(r'<[^>]+>', ' ', text_or_html)
+        text = re.sub(r'\s+', ' ', text).strip()[:8000]
 
         system = """You are a real estate listing data extractor.
-Extract property details from the text and return ONLY a JSON object, no markdown, no explanation.
+Your job is to find specific numeric and text values from listing content and return them as JSON.
 
-JSON schema:
+Return ONLY a valid JSON object. No markdown fences, no explanation, no extra text.
+
+Required JSON fields (use null if not found):
 {
-  "purchase_price": number or null,
-  "address": string or null,
-  "city": string or null,
-  "state": string or null,
-  "zip": string or null,
-  "annual_taxes": number or null,
-  "beds": number or null,
-  "baths": number or null,
-  "sqft": number or null,
-  "hoa_monthly": number or null,
-  "year_built": number or null
+  "purchase_price": <number — the asking/list price, e.g. 189000>,
+  "address": <string — street address only, e.g. "1149 Hodges St">,
+  "city_state_zip": <string — city, state ZIP, e.g. "Lake Charles, LA 70601">,
+  "annual_taxes": <number — annual property tax in dollars. Look for: "taxes/yr", "taxes/year", "annual tax", "property tax $X/yr", "tax $X". Convert monthly to annual by multiplying by 12. e.g. 2400>,
+  "beds": <number>,
+  "baths": <number>,
+  "sqft": <number — living area square footage>,
+  "year_built": <number>,
+  "hoa_monthly": <number — monthly HOA fee, null if none>
 }
 
-Rules:
-- purchase_price is the list/asking price as a plain number
-- annual_taxes is the yearly property tax as a plain number
-- Return null for any field not found
-"""
+IMPORTANT rules:
+- All dollar values as plain numbers without $ or commas
+- annual_taxes: if you see "$200/mo taxes" that is 200*12 = 2400 annual. If you see "$2,400/yr" that is 2400.
+- If a field is genuinely not present anywhere in the text, return null for it
+- Do not guess or fabricate values"""
+
         resp = client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=500,
+            max_tokens=600,
             system=system,
-            messages=[{"role": "user", "content": f"Extract from this listing:\n\n{text}"}],
+            messages=[{"role": "user", "content": f"Extract listing data from this text:\n\n{text}"}],
         )
         raw = resp.content[0].text.strip()
         raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
         parsed = json.loads(raw)
-        # Normalize
+
         result = {}
-        if parsed.get("purchase_price"):
-            result["purchase_price"] = float(parsed["purchase_price"])
-        if parsed.get("address"):
-            result["address"] = parsed["address"]
-        parts = [parsed.get("city"), parsed.get("state"), parsed.get("zip")]
-        parts = [p for p in parts if p]
-        if parts:
-            result["city_state_zip"] = ", ".join(parts[:2]) + (" " + parts[2] if len(parts) > 2 else "")
-        if parsed.get("annual_taxes"):
-            result["annual_taxes"] = float(parsed["annual_taxes"])
-        for k in ("beds", "baths", "sqft", "hoa_monthly", "year_built"):
-            if parsed.get(k) is not None:
-                result[k] = parsed[k]
+        for num_field in ("purchase_price", "annual_taxes", "beds", "baths", "sqft", "year_built", "hoa_monthly"):
+            v = parsed.get(num_field)
+            if v is not None:
+                try:
+                    result[num_field] = float(str(v).replace(",", "").replace("$", ""))
+                except Exception:
+                    pass
+        for str_field in ("address", "city_state_zip"):
+            v = parsed.get(str_field)
+            if v:
+                result[str_field] = str(v).strip()
         return result
+
     except Exception as e:
         return {"error": str(e)}
 
@@ -353,6 +595,9 @@ def import_listing(url: str, use_ai_fallback: bool = True) -> dict:
     elif "realtor.com" in url:
         result = _parse_realtor(html, url)
         source = "Realtor.com"
+    elif "trulia.com" in url:
+        result = _parse_trulia(html, url)
+        source = "Trulia"
     else:
         result = _parse_generic(html, url)
         source = "Listing page"
