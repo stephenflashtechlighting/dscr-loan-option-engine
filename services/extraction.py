@@ -156,9 +156,60 @@ def _loan_estimate_extract(text: str) -> dict:
         results["program_name"] = loan_type.strip()
         confidence["program_name"] = "low"
 
+    results = sanitize_extracted_fields(results)
     return {"fields": results, "confidence": confidence, "clean_text": normalize_pdf_text(text)}
 
 
+
+
+def sanitize_extracted_fields(fields: dict) -> dict:
+    cleaned = dict(fields or {})
+
+    def as_float(v):
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    bad_lender_names = {
+        "charges (smart fees)",
+        "charges",
+        "smart fees",
+        "title charges",
+        "lender charges",
+    }
+
+    lender = (cleaned.get("lender_name") or "").strip()
+    if lender.lower() in bad_lender_names:
+        cleaned["lender_name"] = ""
+
+    rate = as_float(cleaned.get("rate_percent"))
+    if rate is not None and not (0.0 <= rate <= 25.0):
+        cleaned.pop("rate_percent", None)
+
+    points = as_float(cleaned.get("points_percent"))
+    if points is not None and not (-5.0 <= points <= 10.0):
+        cleaned.pop("points_percent", None)
+
+    for key, limits in {
+        "loan_term_months": (1, 600),
+        "amortization_months": (1, 600),
+        "interest_only_months": (0, 120),
+        "prepay_months": (0, 120),
+    }.items():
+        try:
+            val = int(float(cleaned.get(key)))
+            if not (limits[0] <= val <= limits[1]):
+                cleaned.pop(key, None)
+        except Exception:
+            pass
+
+    for key in ["underwriting_fee", "processing_fee", "appraisal_fee", "title_fee", "lender_credit"]:
+        val = as_float(cleaned.get(key))
+        if val is not None and val < 0:
+            cleaned.pop(key, None)
+
+    return cleaned
 def regex_extract(text: str) -> dict:
     text = normalize_pdf_text(text)
     results = {}
@@ -234,6 +285,7 @@ def regex_extract(text: str) -> dict:
     for key, value in le_result.get("confidence", {}).items():
         confidence.setdefault(key, value)
 
+    results = sanitize_extracted_fields(results)
     return {"fields": results, "confidence": confidence, "clean_text": text}
 
 

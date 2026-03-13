@@ -112,30 +112,75 @@ if result is not None:
     if preview_text:
         with st.expander("Show extracted source text", expanded=False):
             st.text(preview_text[:4000])
+    def safe_float(val, default=0.0):
+        try:
+            if val is None or val == "":
+                return float(default)
+            return float(val)
+        except Exception:
+            return float(default)
+
+    def safe_int(val, default=0):
+        try:
+            if val is None or val == "":
+                return int(default)
+            return int(float(val))
+        except Exception:
+            return int(default)
+
+    def clamp(val, min_val=None, max_val=None):
+        if min_val is not None and val < min_val:
+            return min_val
+        if max_val is not None and val > max_val:
+            return max_val
+        return val
+
+    raw_lender_name = (fields.get("lender_name") or "").strip()
+    bad_lender_names = {"charges (smart fees)", "charges", "smart fees", "title charges", "lender charges"}
+    if raw_lender_name.lower() in bad_lender_names:
+        raw_lender_name = ""
+
+    rate_default = clamp(safe_float(fields.get("rate_percent", 7.25), 7.25), 0.0, 25.0)
+    raw_points = safe_float(fields.get("points_percent", 0.0), 0.0)
+    points_was_clamped = raw_points < -5.0 or raw_points > 10.0
+    points_default = clamp(raw_points, -5.0, 10.0)
+    loan_term_default = clamp(safe_int(fields.get("loan_term_months", 360), 360), 1, 600)
+    amortization_default = clamp(safe_int(fields.get("amortization_months", 360), 360), 1, 600)
+    io_default = clamp(safe_int(fields.get("interest_only_months", 0), 0), 0, 120)
+    prepay_months_default = clamp(safe_int(fields.get("prepay_months", 60), 60), 0, 120)
+    uw_default = max(0.0, safe_float(fields.get("underwriting_fee", FEE_DEFAULTS["underwriting_fee"]), FEE_DEFAULTS["underwriting_fee"]))
+    proc_default = max(0.0, safe_float(fields.get("processing_fee", FEE_DEFAULTS["processing_fee"]), FEE_DEFAULTS["processing_fee"]))
+    appraisal_default = max(0.0, safe_float(fields.get("appraisal_fee", FEE_DEFAULTS["appraisal_fee"]), FEE_DEFAULTS["appraisal_fee"]))
+    title_default = max(0.0, safe_float(fields.get("title_fee", FEE_DEFAULTS["title_fee"]), FEE_DEFAULTS["title_fee"]))
+    credit_default = max(0.0, safe_float(fields.get("lender_credit", 0.0), 0.0))
+
+    if points_was_clamped:
+        st.warning("Extracted points value looked invalid and was clamped for manual review. Please verify it against the source document.")
 
     with st.form("review_form"):
         col1, col2 = st.columns(2)
         with col1:
-            lender_name = st.text_input("Lender name *", value=fields.get("lender_name", ""), help=f"Confidence: {confidence.get('lender_name', 'low')}")
+            lender_name = st.text_input("Lender name *", value=raw_lender_name, help=f"Confidence: {confidence.get('lender_name', 'low')}")
             program_name = st.text_input("Program name", value=fields.get("program_name", "DSCR 30yr"))
-            rate_percent = st.number_input("Note rate (%)", value=float(fields.get("rate_percent", 7.25)), min_value=0.0, max_value=25.0, step=0.125, format="%.3f", help=f"Confidence: {confidence.get('rate_percent', 'low')}")
-            points_percent = st.number_input("Points (%)", value=float(fields.get("points_percent", 0.0)), min_value=-5.0, max_value=10.0, step=0.125, format="%.3f", help=f"Confidence: {confidence.get('points_percent', 'low')}")
-            loan_term_months = st.number_input("Loan term (months)", value=int(fields.get("loan_term_months", 360)), min_value=1, max_value=600, step=12)
-            amortization_months = st.number_input("Amortization (months)", value=int(fields.get("amortization_months", 360)), min_value=1, max_value=600, step=12)
-            io_months = st.number_input("Interest-only period (months)", value=int(fields.get("interest_only_months", 0)), min_value=0, max_value=120, step=12)
+            rate_percent = st.number_input("Note rate (%)", value=rate_default, min_value=0.0, max_value=25.0, step=0.125, format="%.3f", help=f"Confidence: {confidence.get('rate_percent', 'low')}")
+            points_percent = st.number_input("Points (%)", value=points_default, min_value=-5.0, max_value=10.0, step=0.125, format="%.3f", help=f"Confidence: {confidence.get('points_percent', 'low')}")
+            loan_term_months = st.number_input("Loan term (months)", value=loan_term_default, min_value=1, max_value=600, step=12)
+            amortization_months = st.number_input("Amortization (months)", value=amortization_default, min_value=1, max_value=600, step=12)
+            io_months = st.number_input("Interest-only period (months)", value=io_default, min_value=0, max_value=120, step=12)
 
         with col2:
             prepay_type_val = fields.get("prepay_type", "declining")
             if prepay_type_val not in PREPAY_TYPES:
                 prepay_type_val = "declining"
             prepay_type = st.selectbox("Prepay type", PREPAY_TYPES, index=PREPAY_TYPES.index(prepay_type_val), help=f"Confidence: {confidence.get('prepay_type', 'low')}")
-            prepay_months = st.number_input("Prepay window (months)", value=int(fields.get("prepay_months", 60)), min_value=0, max_value=120, step=6, help=f"Confidence: {confidence.get('prepay_months', 'low')}")
-            uw_fee = st.number_input("Underwriting fee ($)", value=float(fields.get("underwriting_fee", FEE_DEFAULTS["underwriting_fee"])), min_value=0.0, step=50.0)
-            proc_fee = st.number_input("Processing fee ($)", value=float(fields.get("processing_fee", FEE_DEFAULTS["processing_fee"])), min_value=0.0, step=50.0)
-            appraisal = st.number_input("Appraisal fee ($)", value=float(fields.get("appraisal_fee", FEE_DEFAULTS["appraisal_fee"])), min_value=0.0, step=50.0)
-            title_fee = st.number_input("Title fee ($)", value=float(fields.get("title_fee", FEE_DEFAULTS["title_fee"])), min_value=0.0, step=50.0)
-            credit = st.number_input("Lender credit ($)", value=float(fields.get("lender_credit", 0.0)), min_value=0.0, step=100.0)
+            prepay_months = st.number_input("Prepay window (months)", value=prepay_months_default, min_value=0, max_value=120, step=6, help=f"Confidence: {confidence.get('prepay_months', 'low')}")
+            uw_fee = st.number_input("Underwriting fee ($)", value=uw_default, min_value=0.0, step=50.0)
+            proc_fee = st.number_input("Processing fee ($)", value=proc_default, min_value=0.0, step=50.0)
+            appraisal = st.number_input("Appraisal fee ($)", value=appraisal_default, min_value=0.0, step=50.0)
+            title_fee = st.number_input("Title fee ($)", value=title_default, min_value=0.0, step=50.0)
+            credit = st.number_input("Lender credit ($)", value=credit_default, min_value=0.0, step=100.0)
 
+        notes = st.text_area
         notes = st.text_area("Notes (optional)", height=60, value=fields.get("notes", f"Imported via {source_label}"))
         st.caption("⚠️ Always verify extracted values against the original lender document before using for decisions.")
         col_save, col_clear = st.columns([1, 4])

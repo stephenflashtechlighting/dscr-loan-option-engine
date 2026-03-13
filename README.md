@@ -1,4 +1,4 @@
-# DSCR Loan Option Engine v2.7
+# DSCR Loan Option Engine v2.7.2
 
 Decision-support software for normalizing investor loan quotes, generating hold-period-aware comparisons, and exporting borrower-ready decision memos.
 
