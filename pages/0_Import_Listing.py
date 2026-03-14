@@ -34,7 +34,8 @@ Property taxes: $2,400/year
 Built 1978
 HOA: None
 
-Or paste directly from Trulia, MLS, Zillow, Redfin, Realtor, or an email.""",
+Or paste a Trulia listing URL, or enter property details manually below.
+URL import is tested for **Trulia only**. Other sites may work but are not guaranteed.""",
         key="paste_listing_text"
     )
 
